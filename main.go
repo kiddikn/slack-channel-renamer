@@ -41,6 +41,8 @@ func main() {
 		log.Fatal("SLACK_USER_TOKEN environment variable is not set")
 	}
 
+	applyMode := strings.ToLower(os.Getenv("APPLY")) == "true"
+
 	client := slack.New(token)
 
 	plan, err := loadCSV(csvFileName)
@@ -62,8 +64,18 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	log.Println("validation passed, starting rename...")
+	log.Println("validation passed")
+	fmt.Println("rename plan:")
+	for _, entry := range plan {
+		fmt.Printf("  %s -> %s\n", entry.asis, entry.tobe)
+	}
 
+	if !applyMode {
+		log.Println("dry-run mode (set APPLY=true to execute)")
+		return
+	}
+
+	log.Println("starting rename...")
 	failed := false
 	for i, entry := range plan {
 		if i > 0 {
