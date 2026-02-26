@@ -22,7 +22,7 @@ const (
 	maxRetries     = 3
 )
 
-var channelNameRe = regexp.MustCompile(`^[a-z0-9_-]{1,80}$`)
+var channelNameRe = regexp.MustCompile(`^[a-z0-9_\-\p{L}\p{N}]{1,80}$`)
 
 type renameEntry struct {
 	asis string
@@ -30,7 +30,8 @@ type renameEntry struct {
 }
 
 type channelInfo struct {
-	ID string
+	ID         string
+	IsArchived bool
 }
 
 func main() {
@@ -57,7 +58,8 @@ func main() {
 	}
 	log.Printf("fetched %d public channels", len(channels))
 
-	if errs := validatePlan(plan, channels); len(errs) > 0 {
+	errs, skipped := validatePlan(plan, channels)
+	if len(errs) > 0 {
 		fmt.Fprintln(os.Stderr, "validation errors:")
 		for _, e := range errs {
 			fmt.Fprintf(os.Stderr, "  - %s\n", e)
@@ -65,8 +67,22 @@ func main() {
 		os.Exit(1)
 	}
 	log.Println("validation passed")
-	fmt.Println("rename plan:")
+	if len(skipped) > 0 {
+		fmt.Println("skipped entries:")
+		for _, s := range skipped {
+			fmt.Printf("  - %s\n", s)
+		}
+	}
+
+	activePlan := make([]renameEntry, 0, len(plan))
 	for _, entry := range plan {
+		if ch, ok := channels[entry.asis]; ok && !ch.IsArchived {
+			activePlan = append(activePlan, entry)
+		}
+	}
+
+	fmt.Println("rename plan:")
+	for _, entry := range activePlan {
 		fmt.Printf("  %s -> %s\n", entry.asis, entry.tobe)
 	}
 
@@ -77,7 +93,7 @@ func main() {
 
 	log.Println("starting rename...")
 	failed := false
-	for i, entry := range plan {
+	for i, entry := range activePlan {
 		if i > 0 {
 			time.Sleep(sleepBetween)
 		}
@@ -143,10 +159,8 @@ func loadCSV(path string) ([]renameEntry, error) {
 }
 
 // validatePlan checks that all rename operations are safe to execute.
-// It returns all validation errors without executing any renames.
-func validatePlan(plan []renameEntry, channels map[string]channelInfo) []string {
-	var errs []string
-
+// It returns all validation errors and skipped entries (archived channels) without executing any renames.
+func validatePlan(plan []renameEntry, channels map[string]channelInfo) (errs []string, skipped []string) {
 	// Count tobe targets to detect duplicates.
 	tobeCount := make(map[string]int)
 	for _, e := range plan {
@@ -155,8 +169,14 @@ func validatePlan(plan []renameEntry, channels map[string]channelInfo) []string 
 	duplicatesReported := make(map[string]bool)
 
 	for _, e := range plan {
-		if _, ok := channels[e.asis]; !ok {
-			errs = append(errs, fmt.Sprintf("channel %q does not exist", e.asis))
+		ch, ok := channels[e.asis]
+		if !ok {
+			errs = append(errs, fmt.Sprintf("channel %q not found", e.asis))
+			continue
+		}
+		if ch.IsArchived {
+			skipped = append(skipped, fmt.Sprintf("channel %q is archived, skipping", e.asis))
+			continue
 		}
 
 		if !channelNameRe.MatchString(e.tobe) {
@@ -165,7 +185,7 @@ func validatePlan(plan []renameEntry, channels map[string]channelInfo) []string 
 		}
 
 		if e.asis != e.tobe {
-			if _, exists := channels[e.tobe]; exists {
+			if existing, exists := channels[e.tobe]; exists && !existing.IsArchived {
 				errs = append(errs, fmt.Sprintf("target channel %q already exists", e.tobe))
 			}
 		}
@@ -176,10 +196,10 @@ func validatePlan(plan []renameEntry, channels map[string]channelInfo) []string 
 		}
 	}
 
-	return errs
+	return errs, skipped
 }
 
-// fetchPublicChannels retrieves all non-archived public channels and returns
+// fetchPublicChannels retrieves all public channels (including archived) and returns
 // a map of channel name to channelInfo.
 func fetchPublicChannels(client *slack.Client) (map[string]channelInfo, error) {
 	channels := make(map[string]channelInfo)
@@ -189,7 +209,7 @@ func fetchPublicChannels(client *slack.Client) (map[string]channelInfo, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), apiTimeout)
 		result, nextCursor, err := client.GetConversationsContext(ctx, &slack.GetConversationsParameters{
 			Cursor:          cursor,
-			ExcludeArchived: true,
+			ExcludeArchived: false,
 			Types:           []string{"public_channel"},
 			Limit:           200,
 		})
@@ -210,7 +230,7 @@ func fetchPublicChannels(client *slack.Client) (map[string]channelInfo, error) {
 		}
 
 		for _, ch := range result {
-			channels[ch.Name] = channelInfo{ID: ch.ID}
+			channels[ch.Name] = channelInfo{ID: ch.ID, IsArchived: ch.IsArchived}
 		}
 
 		if nextCursor == "" {
